@@ -18,12 +18,14 @@ urllib3==2.7.0
     #   requests
 charset-normalizer==3.4.7
     # via requests
+docker==7.1.0
+    # via -r /requirements/requirements_worker_wrapper.in
 durationpy==0.10
     # via kubernetes
 idna==3.15
     # via requests
 kubernetes==35.0.0
-    # via -r requirements/requirements_worker_wrapper.in
+    # via -r /requirements/requirements_worker_wrapper.in
 oauthlib==3.3.1
     # via requests-oauthlib
 python-dateutil==2.9.0.post0
@@ -32,6 +34,7 @@ pyyaml==6.0.3
     # via kubernetes
 requests==2.32.4
     # via
+    #   docker
     #   kubernetes
     #   requests-oauthlib
 requests-oauthlib==2.0.0
@@ -40,10 +43,11 @@ six==1.17.0
     # via
     #   kubernetes
     #   python-dateutil
-tenacity==9.0.0
-    # via -r requirements/requirements_worker_wrapper.in
+tenacity==9.1.4
+    # via -r /requirements/requirements_worker_wrapper.in
 urllib3==2.2.3
     # via
+    #   docker
     #   kubernetes
     #   requests
 websocket-client==1.8.0
