@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import re
@@ -66,7 +67,7 @@ if settings.DEBUG:
     logger.setLevel(logging.DEBUG)
 
 TIMEOUT_ERROR_EXIT_CODE = -1
-TMP_FILE = Path("/tmp")
+TMP_FILE = Path(os.environ.get("QFC_SHARED_DIR", "/io"))
 
 TRANSFORMATION_GRIDS_PATH = "/transformation_grids"
 
@@ -117,21 +118,21 @@ class JobRun:
             else:
                 logger.critical(msg, exc_info=err)
 
-            self.debug_qgis_container_is_enabled = bool(
-                settings.DEBUG and settings.DEBUG_QGIS_DEBUGPY_PORT
+        self.debug_qgis_container_is_enabled = bool(
+            settings.DEBUG and settings.DEBUG_QGIS_DEBUGPY_PORT
+        )
+
+        self.qgis_images = {
+            3: settings.QFIELDCLOUD_QGIS3_IMAGE_NAME,
+            4: settings.QFIELDCLOUD_QGIS4_IMAGE_NAME,
+        }
+
+        if self.debug_qgis_container_is_enabled and self.job is not None:
+            logger.warning(
+                f"Debugging is enabled for job {self.job.id}. "
+                "The worker will wait for debugger to attach on port "
+                f"{settings.DEBUG_QGIS_DEBUGPY_PORT}."
             )
-
-            self.qgis_images = {
-                3: settings.QFIELDCLOUD_QGIS3_IMAGE_NAME,
-                4: settings.QFIELDCLOUD_QGIS4_IMAGE_NAME,
-            }
-
-            if self.debug_qgis_container_is_enabled and self.job is not None:
-                logger.warning(
-                    f"Debugging is enabled for job {self.job.id}. "
-                    "The worker will wait for debugger to attach on port "
-                    f"{settings.DEBUG_QGIS_DEBUGPY_PORT}."
-                )
 
     def get_context(self) -> dict[str, Any]:
         context = model_to_dict(self.job)
@@ -261,21 +262,18 @@ class JobRun:
         ## TODO this settings.QFC_K8S_JOB_BACKOFF_LIMIT needs to be added
         container_spec = {
             "name": "worker",
-            "image": settings.QFIELDCLOUD_QGIS_IMAGE_NAME,
+            "image": self.get_qgis_image(),
             "command": command,
             "env": env_list,
             "resources": {
                 "requests": {
-                    "memory": "512Mi",
-                    "cpu": "500m",
+                    "memory": settings.QFC_K8S_MEMORY_REQUEST,
+                    "cpu": settings.QFC_K8S_CPU_REQUEST,
                 },
                 "limits": {
-                    "memory": str(
-                        config.WORKER_QGIS_MEMORY_LIMIT
-                    ),
-                    # TODO to replace config.WORKER_QGIS_CPU_SHARES
-                    "cpu": settings.QFC_K8S_CPU_LIMIT, 
-                }
+                    "memory": settings.QFC_K8S_MEMORY_LIMIT,
+                    "cpu": settings.QFC_K8S_CPU_LIMIT,
+                },
             },
             "volumeMounts": [
                 {
@@ -470,14 +468,14 @@ class JobRun:
         )
 
         #### Remove and change to worker started at
-        self.job.worker_started_at = timezone.now()
-        self.job.save(update_fields=["worker_started_at"])
+        self.job.docker_started_at = timezone.now()
+        self.job.save(update_fields=["docker_started_at"])
 
         try:
             self._create_job(
                 batch_api=batch_api,
                 namespace=namespace,
-                body=manifest,
+                manifest=manifest,
             )
 
         except ApiException as err:
@@ -498,8 +496,8 @@ class JobRun:
         )
 
         #### Remove and change to worker finished at
-        self.job.worker_finished_at = timezone.now()
-        self.job.save(update_fields=["worker_finished_at"])
+        self.job.docker_finished_at = timezone.now()
+        self.job.save(update_fields=["docker_finished_at"])
 
         logs = self._get_pod_logs(
             core_api,
@@ -579,9 +577,14 @@ class JobRun:
                 feedback["error_stack"] = ""
             else:
                 try:
-                    with open(
-                        self.shared_tempdir.joinpath("feedback.json")
-                    ) as f:
+                    feedback_path = self.shared_tempdir.joinpath("feedback.json")
+
+                    if not feedback_path.exists():
+                        fallback_feedback_path = TMP_FILE.joinpath("feedback.json")
+                        if fallback_feedback_path.exists():
+                            feedback_path = fallback_feedback_path
+
+                    with open(feedback_path) as f:
                         feedback = json.load(f)
 
                     if feedback.get("error"):

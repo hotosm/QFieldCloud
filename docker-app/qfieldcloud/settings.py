@@ -846,6 +846,16 @@ QFIELDCLOUD_TRANSFORMATION_GRIDS_VOLUME_NAME = os.environ[
     "QFIELDCLOUD_TRANSFORMATION_GRIDS_VOLUME_NAME"
 ]
 
+QFC_K8S_NAMESPACE = os.environ.get("QFC_K8S_NAMESPACE", "default")
+QFC_K8S_JOB_BACKOFF_LIMIT = int(os.environ.get("QFC_K8S_JOB_BACKOFF_LIMIT", "0"))
+QFC_SHARED_PVC_NAME = os.environ.get("QFC_SHARED_PVC_NAME", "qfieldcloud-shared")
+QFC_K8S_JOB_TIMEOUT_SECONDS = int(os.environ.get("QFC_K8S_JOB_TIMEOUT_SECONDS", "3600"))
+
+QFC_K8S_CPU_REQUEST = os.environ.get("QFC_K8S_CPU_REQUEST", "500m")
+QFC_K8S_CPU_LIMIT = os.environ.get("QFC_K8S_CPU_LIMIT", "1000m")
+QFC_K8S_MEMORY_REQUEST = os.environ.get("QFC_K8S_MEMORY_REQUEST", "512Mi")
+QFC_K8S_MEMORY_LIMIT = os.environ.get("QFC_K8S_MEMORY_LIMIT", "1Gi")
+
 # Name of the docker compose network to be used by the worker containers
 QFIELDCLOUD_DEFAULT_NETWORK = os.environ.get("QFIELDCLOUD_DEFAULT_NETWORK")
 
