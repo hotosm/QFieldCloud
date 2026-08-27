@@ -1,3 +1,4 @@
+import os
 import logging
 import signal
 from time import sleep
@@ -9,15 +10,30 @@ from django.core.management.base import BaseCommand, CommandParser
 from django.db import connection, transaction
 from django.db.models import Q
 from qfieldcloud.core.models import Job
-from worker_wrapper.wrapper import (
-    ApplyDeltaJobRun,
-    CreateProjectJobRun,
-    JobRun,
-    PackageJobRun,
-    ProcessProjectfileJobRun,
-    cancel_orphaned_workers,
+
+execution_mode = os.environ.get(
+    "QFC_WORKER_EXECUTION_MODE",
+    "docker",
 )
 
+if execution_mode == "kubernetes":
+    from worker_wrapper.wrapper_k8s import (
+        ApplyDeltaJobRun,
+        CreateProjectJobRun,
+        JobRun,
+        PackageJobRun,
+        ProcessProjectfileJobRun,
+        cancel_orphaned_workers,
+    )
+else:
+    from worker_wrapper.wrapper import (
+        ApplyDeltaJobRun,
+        CreateProjectJobRun,
+        JobRun,
+        PackageJobRun,
+        ProcessProjectfileJobRun,
+        cancel_orphaned_workers,
+    )
 
 class GracefulKiller:
     alive = True

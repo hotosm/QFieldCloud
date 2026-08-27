@@ -90,7 +90,7 @@ class JobRun:
 
     def __init__(self, job_id: str) -> None:
         self.job = None
-        self.container_timeout_secs = config.WORKER_TIMEOUT_S
+        self.container_timeout_secs = settings.QFIELDCLOUD_WORKER_TIMEOUT_S
 
         try:
             self.job_id = job_id
@@ -505,7 +505,10 @@ class JobRun:
         )
 
         logger.info(
-            f"Kubernetes Job {job_name} finished: {status}"
+            "Kubernetes Job %s finished: succeeded=%s failed=%s",
+            job_name,
+            status.succeeded,
+            status.failed,
         )
 
         if not success:
@@ -851,6 +854,8 @@ class ProcessProjectfileJobRun(JobRun):
             "outputs"
         ]["project_details"]["project_details"]
 
+        update_fields = ["project_details"]
+
         # Since the `Project.qgis_version` field is newly added, we want to backfill it for old projects that didn't have it set,
         # but the `process_projectfile` job can detect the QGIS version from the project file and return it in the feedback, we can set it here.
         # NOTE `Project.qgis_version` is used by `wrapper.JobRun.get_qgis_image()` to detect
@@ -866,10 +871,12 @@ class ProcessProjectfileJobRun(JobRun):
         project.save(update_fields=update_fields)
 
         QgisProject.objects.update_from_details(
-            project, project.the_qgis_file.latest_version, project.project_details
+            project,
+            project.the_qgis_file.latest_version,
+            project.project_details,
         )
 
-    def after_docker_exception(self) -> None:
+    def after_worker_exception(self) -> None:
         project = self.job.project
 
         if hasattr(project, "qgis_project"):
@@ -889,4 +896,6 @@ class CreateProjectJobRun(JobRun):
     ]
 
 def cancel_orphaned_workers() -> None:
-    logger.info("cancel_orphaned_workers disabled for Kubernetes backend")
+    logger.info(
+        "cancel_orphaned_workers disabled for Kubernetes backend"
+    )
