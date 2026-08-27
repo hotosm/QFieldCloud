@@ -542,7 +542,13 @@ class JobRun:
         retriable(lambda: container.remove())()
 
         logger.info(
-            f"Finished execution with code {response['StatusCode']}, logs:\n{logs.decode()}"
+            "Docker worker finished: exit_code=%s",
+            status,
+        )
+
+        logger.debug(
+            "Docker worker logs:\n%s",
+            logs.decode("utf-8", errors="replace"),
         )
 
         if response["StatusCode"] == TIMEOUT_ERROR_EXIT_CODE:

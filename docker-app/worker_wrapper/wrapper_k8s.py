@@ -73,7 +73,16 @@ TRANSFORMATION_GRIDS_PATH = "/transformation_grids"
 
 TOKEN_EXPIRATION_TIME_BUFFER_S = 60
 
-
+def load_kubernetes() -> None:
+        """
+        Try in-cluster config first.
+        Fall back to local kubeconfig for development.
+        """
+        try:
+            k8s_config.load_incluster_config()
+        except Exception:
+            k8s_config.load_kube_config()
+            
 class JobException(Exception):
     pass
 
@@ -375,16 +384,7 @@ class JobRun:
         )
 
     def _load_kubernetes(self) -> None:
-        """
-        Try in-cluster config first.
-        Fall back to local kubeconfig for development.
-        """
-
-        try:
-            k8s_config.load_incluster_config()
-
-        except Exception:
-            k8s_config.load_kube_config()
+        load_kubernetes()
 
     def _wait_for_job_completion(
         self,
@@ -507,8 +507,8 @@ class JobRun:
         logger.info(
             "Kubernetes Job %s finished: succeeded=%s failed=%s",
             job_name,
-            status.succeeded,
-            status.failed,
+            status.get("succeeded"),
+            status.get("failed"),
         )
 
         if not success:
@@ -611,7 +611,7 @@ class JobRun:
                 update_fields=["output", "feedback"]
             )
 
-            if exit_code != 0:
+            if exit_code != 0 or feedback.get("error"):
                 self.job.status = Job.Status.FAILED
 
                 self.job.save(update_fields=["status"])
@@ -896,6 +896,56 @@ class CreateProjectJobRun(JobRun):
     ]
 
 def cancel_orphaned_workers() -> None:
-    logger.info(
-        "cancel_orphaned_workers disabled for Kubernetes backend"
-    )
+    try:
+        load_kubernetes()
+
+        batch_api = k8s_client.BatchV1Api()
+        namespace = settings.QFC_K8S_NAMESPACE
+
+        try:
+            jobs = batch_api.list_namespaced_job(
+                namespace=namespace,
+                label_selector="app=qfieldcloud-worker",
+            )
+        except ApiException as err:
+            logger.warning(
+                "Failed to list Kubernetes worker Jobs while checking for orphans.",
+                exc_info=err,
+            )
+            return
+
+        for k8s_job in jobs.items:
+            labels = k8s_job.metadata.labels or {}
+            job_id = labels.get("job_id")
+
+            if not job_id:
+                continue
+
+            if Job.objects.filter(id=job_id).exists():
+                continue
+
+            job_name = k8s_job.metadata.name
+
+            try:
+                batch_api.delete_namespaced_job(
+                    name=job_name,
+                    namespace=namespace,
+                    propagation_policy="Background",
+                )
+
+                logger.info(
+                    "Cancelled orphaned Kubernetes worker Job %s",
+                    job_name,
+                )
+
+            except ApiException as err:
+                if err.status == 404:
+                    continue
+
+                logger.warning(
+                    "Failed to delete orphaned Kubernetes worker Job %s",
+                    job_name,
+                    exc_info=err,
+                )
+    except Exception:
+        logger.exception("Failed orphaned Kubernetes worker cleanup")
