@@ -82,7 +82,7 @@ def load_kubernetes() -> None:
             k8s_config.load_incluster_config()
         except Exception:
             k8s_config.load_kube_config()
-            
+
 class JobException(Exception):
     pass
 
@@ -174,6 +174,11 @@ class JobRun:
     def get_environment(self) -> dict[str, str]:
         extra_envvars = {}
 
+        if Path(settings.QFIELDCLOUD_CUSTOM_CA_FILENAME).exists():
+            extra_envvars["REQUESTS_CA_BUNDLE"] = (
+                settings.QFIELDCLOUD_CUSTOM_CA_FILENAME
+            )
+            
         pgservice_file_contents = ""
 
         for secret in Secret.objects.for_user_and_project(
@@ -266,8 +271,52 @@ class JobRun:
             {"name": key, "value": value}
             for key, value in environment.items()
         ]
+        volume_mounts = [
+            {
+                "name": "shared-data",
+                "mountPath": "/io",
+            },
+            {
+                "name": "transformation-grids",
+                "mountPath": TRANSFORMATION_GRIDS_PATH,
+                "readOnly": True,
+            },
+        ]
 
-        ## TODO this settings.QFC_K8S_JOB_BACKOFF_LIMIT needs to be added
+        volumes = [
+            {
+                "name": "shared-data",
+                "persistentVolumeClaim": {
+                    "claimName": settings.QFC_SHARED_PVC_NAME,
+                },
+            },
+            {
+                "name": "transformation-grids",
+                "persistentVolumeClaim": {
+                    "claimName": settings.QFIELDCLOUD_TRANSFORMATION_GRIDS_VOLUME_NAME,
+                },
+            },
+        ]
+        '''
+        ### TODO When a equivalent PVC exists in Kubernetes
+        if Path(settings.QFIELDCLOUD_CUSTOM_CA_FILENAME).exists():
+            volume_mounts.append(
+                {
+                    "name": "custom-ca",
+                    "mountPath": settings.QFIELDCLOUD_CUSTOM_CA_DIR,
+                    "readOnly": True,
+                }
+            )
+
+            volumes.append(
+                {
+                    "name": "custom-ca",
+                    "persistentVolumeClaim": {
+                        "claimName": settings.QFIELDCLOUD_CUSTOM_CA_VOLUME_NAME,
+                    },
+                }
+            )
+        '''
         container_spec = {
             "name": "worker",
             "image": self.get_qgis_image(),
@@ -283,17 +332,7 @@ class JobRun:
                     "cpu": settings.QFC_K8S_CPU_LIMIT,
                 },
             },
-            "volumeMounts": [
-                {
-                    "name": "shared-data",
-                    "mountPath": "/io",
-                },
-                {
-                    "name": "transformation-grids",
-                    "mountPath": TRANSFORMATION_GRIDS_PATH,
-                    "readOnly": True,
-                },
-            ],
+            "volumeMounts": volume_mounts,
         }
         if self.debug_qgis_container_is_enabled:
             container_spec["ports"] = [
@@ -324,20 +363,7 @@ class JobRun:
                     "spec": {
                         "restartPolicy": "Never",
                         "containers": [container_spec],
-                        "volumes": [
-                            {
-                                "name": "shared-data",
-                                "persistentVolumeClaim": {
-                                    "claimName": settings.QFC_SHARED_PVC_NAME,
-                                },
-                            },
-                            {
-                                "name": "transformation-grids",
-                                "persistentVolumeClaim": {
-                                    "claimName": settings.QFIELDCLOUD_TRANSFORMATION_GRIDS_VOLUME_NAME,
-                                },
-                            },
-                        ],
+                        "volumes": volumes,
                     },
                 },
             },
