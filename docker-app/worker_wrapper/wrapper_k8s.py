@@ -75,7 +75,7 @@ TRANSFORMATION_GRIDS_PATH = "/transformation_grids"
 TOKEN_EXPIRATION_TIME_BUFFER_S = 60
 
 def load_kubernetes() -> None:
-     """Try in-cluster config first.Fall back to local kubeconfig for development."""
+    """Try in-cluster config first. Fall back to local kubeconfig for development."""
 
     try:
         k8s_config.load_incluster_config()
