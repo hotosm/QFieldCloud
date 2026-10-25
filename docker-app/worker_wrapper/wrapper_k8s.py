@@ -1,6 +1,6 @@
-import os
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -12,15 +12,15 @@ from traceback import TracebackException
 from typing import Any
 
 import sentry_sdk
-from constance import config
+import urllib3
 from django.conf import settings
 from django.db import transaction
 from django.forms.models import model_to_dict
 from django.utils import timezone
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
-from kubernetes.config.config_exception import ConfigException
 from kubernetes.client.rest import ApiException
+from kubernetes.config.config_exception import ConfigException
 from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core.models import (
     ApplyJob,
@@ -36,11 +36,10 @@ from qfieldcloud.project.models import QgisProject
 from qfieldcloud.project.utils.project_utils import get_qgis_major_version
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
-import urllib3
 
 # TODO:
 # Refactor worker orchestration into pluggable backends:
@@ -74,13 +73,14 @@ TRANSFORMATION_GRIDS_PATH = "/transformation_grids"
 
 TOKEN_EXPIRATION_TIME_BUFFER_S = 60
 
+
 def load_kubernetes() -> None:
     """Try in-cluster config first. Fall back to local kubeconfig for development."""
-
     try:
         k8s_config.load_incluster_config()
     except ConfigException:
         k8s_config.load_kube_config()
+
 
 class JobError(Exception):
     pass
@@ -182,7 +182,7 @@ class JobRun:
             extra_envvars["REQUESTS_CA_BUNDLE"] = (
                 settings.QFIELDCLOUD_CUSTOM_CA_FILENAME
             )
-            
+
         pgservice_file_contents = ""
 
         for secret in Secret.objects.for_user_and_project(
@@ -196,13 +196,10 @@ class JobRun:
                 pgservice_file_contents += f"\n{secret.value}"
 
             else:
-                raise NotImplementedError(
-                    f"Unknown secret type: {secret.type}"
-                )
+                raise NotImplementedError(f"Unknown secret type: {secret.type}")
 
         token_expires_at = timezone.now() + timedelta(
-            seconds=self.container_timeout_secs
-            + TOKEN_EXPIRATION_TIME_BUFFER_S
+            seconds=self.container_timeout_secs + TOKEN_EXPIRATION_TIME_BUFFER_S
         )
 
         token = AuthToken.objects.create(
@@ -214,9 +211,7 @@ class JobRun:
         return {
             **extra_envvars,
             "PGSERVICE_FILE_CONTENTS": pgservice_file_contents,
-            "QFIELDCLOUD_EXTRA_ENVVARS": json.dumps(
-                sorted(extra_envvars.keys())
-            ),
+            "QFIELDCLOUD_EXTRA_ENVVARS": json.dumps(sorted(extra_envvars.keys())),
             "QFIELDCLOUD_TOKEN": token.key,
             "QFIELDCLOUD_URL": settings.QFIELDCLOUD_WORKER_QFIELDCLOUD_URL,
             "JOB_ID": str(self.job.id),
@@ -250,8 +245,7 @@ class JobRun:
         pass
 
     def _sanitize_name(self, name: str) -> str:
-        """ Kubernetes Job names must match DNS label rules."""
-
+        """Kubernetes Job names must match DNS label rules."""
         name = name.lower()
         name = re.sub(r"[^a-z0-9-]", "-", name)
         name = re.sub(r"-+", "-", name)
@@ -263,14 +257,9 @@ class JobRun:
         command: list[str],
         environment: dict[str, str],
     ) -> dict[str, Any]:
-        job_name = self._sanitize_name(
-            f"qfc-job-{self.job.id}"
-        )
+        job_name = self._sanitize_name(f"qfc-job-{self.job.id}")
 
-        env_list = [
-            {"name": key, "value": value}
-            for key, value in environment.items()
-        ]
+        env_list = [{"name": key, "value": value} for key, value in environment.items()]
         volume_mounts = [
             {
                 "name": "shared-data",
@@ -297,7 +286,7 @@ class JobRun:
                 },
             },
         ]
-        '''
+        """
         ### TODO When a equivalent PVC exists in Kubernetes
         if Path(settings.QFIELDCLOUD_CUSTOM_CA_FILENAME).exists():
             volume_mounts.append(
@@ -316,7 +305,7 @@ class JobRun:
                     },
                 }
             )
-        '''
+        """
         container_spec = {
             "name": "worker",
             "image": self.get_qgis_image(),
@@ -340,6 +329,7 @@ class JobRun:
                     "containerPort": settings.DEBUG_QGIS_DEBUGPY_PORT,
                 }
             ]
+
         job_labels = {
             "app": "qfieldcloud-worker",
             "job_id": str(self.job.id),
@@ -368,9 +358,9 @@ class JobRun:
                 },
             },
         }
-        
+
         return manifest
-    
+
     @k8s_retry
     def _list_job_pods(
         self,
@@ -394,14 +384,14 @@ class JobRun:
             name=pod_name,
             namespace=namespace,
         )
-    
+
     @k8s_retry
     def _create_job(self, batch_api, namespace, manifest):
         return batch_api.create_namespaced_job(
             namespace=namespace,
             body=manifest,
         )
-    
+
     @k8s_retry
     def _read_job_status(self, batch_api, job_name, namespace):
         return batch_api.read_namespaced_job_status(
@@ -488,9 +478,7 @@ class JobRun:
 
         job_name = manifest["metadata"]["name"]
 
-        logger.info(
-            f"Creating Kubernetes Job {job_name}"
-        )
+        logger.info(f"Creating Kubernetes Job {job_name}")
 
         #### Remove and change to worker started at
         self.job.docker_started_at = timezone.now()
@@ -566,13 +554,9 @@ class JobRun:
                 self.job.status = Job.Status.PENDING
                 self.job.started_at = None
 
-                self.job.save(
-                    update_fields=["status", "started_at"]
-                )
+                self.job.save(update_fields=["status", "started_at"])
 
-                logger.warning(
-                    f"Concurrent jobs occurred for job {self.job}."
-                )
+                logger.warning(f"Concurrent jobs occurred for job {self.job}.")
 
                 sentry_sdk.capture_message(
                     f"Concurrent jobs occurred for job {self.job}."
@@ -584,9 +568,7 @@ class JobRun:
 
             command = self.get_command()
 
-            exit_code, output = self._run_kubernetes_job(
-                command
-            )
+            exit_code, output = self._run_kubernetes_job(command)
 
             try:
                 self.job.refresh_from_db()
@@ -633,9 +615,7 @@ class JobRun:
             self.job.output = output.decode("utf-8")
             self.job.feedback = feedback
 
-            self.job.save(
-                update_fields=["output", "feedback"]
-            )
+            self.job.save(update_fields=["output", "feedback"])
 
             if exit_code != 0 or feedback.get("error"):
                 self.job.status = Job.Status.FAILED
@@ -658,9 +638,7 @@ class JobRun:
             self.job.finished_at = timezone.now()
             self.job.status = Job.Status.FINISHED
 
-            self.job.save(
-                update_fields=["status", "finished_at"]
-            )
+            self.job.save(update_fields=["status", "finished_at"])
 
             # Global error handler when handling a job
         except Exception as err:  # noqa: BLE001
@@ -692,9 +670,8 @@ class JobRun:
                 )
 
             except Exception:
-                logger.exception(
-                    "Failed updating failed job state"
-                )
+                logger.exception("Failed updating failed job state")
+
 
 class PackageJobRun(JobRun):
     job_class = PackageJob
@@ -713,17 +690,11 @@ class PackageJobRun(JobRun):
         self.data_last_packaged_at = timezone.now()
 
     def after_worker_run(self) -> None:
-        self.job.project.data_last_packaged_at = (
-            self.data_last_packaged_at
-        )
+        self.job.project.data_last_packaged_at = self.data_last_packaged_at
 
-        self.job.project.save(
-            update_fields=("data_last_packaged_at",)
-        )
+        self.job.project.save(update_fields=("data_last_packaged_at",))
 
-        packages.delete_obsolete_packages(
-            projects=[self.job.project]
-        )
+        packages.delete_obsolete_packages(projects=[self.job.project])
 
 
 class ApplyDeltaJobRun(JobRun):
@@ -743,7 +714,7 @@ class ApplyDeltaJobRun(JobRun):
                 *self.command,
                 "--overwrite-conflicts",
             ]
-    
+
     def _prepare_deltas(self, deltas: Iterable[Delta]) -> dict[str, Any]:
         delta_contents = []
         delta_client_ids = []
@@ -857,6 +828,7 @@ class ApplyDeltaJobRun(JobRun):
             modified_pk=None,
         )
 
+
 class ProcessProjectfileJobRun(JobRun):
     job_class = ProcessProjectfileJob
 
@@ -876,9 +848,9 @@ class ProcessProjectfileJobRun(JobRun):
     def after_worker_run(self) -> None:
         project = self.job.project
 
-        project.project_details = self.job.feedback[
-            "outputs"
-        ]["project_details"]["project_details"]
+        project.project_details = self.job.feedback["outputs"]["project_details"][
+            "project_details"
+        ]
 
         update_fields = ["project_details"]
 
@@ -913,6 +885,7 @@ class ProcessProjectfileJobRun(JobRun):
             project.project_details = None
             project.save(update_fields=("project_details",))
 
+
 class CreateProjectJobRun(JobRun):
     job_class = Job
 
@@ -920,6 +893,7 @@ class CreateProjectJobRun(JobRun):
         "create_project",
         "%(project__id)s",
     ]
+
 
 def cancel_orphaned_workers() -> None:
     try:

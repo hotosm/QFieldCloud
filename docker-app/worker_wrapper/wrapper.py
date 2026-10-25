@@ -1,7 +1,7 @@
 import io
-import os
 import json
 import logging
+import os
 import shutil
 import tarfile
 import tempfile
@@ -33,7 +33,6 @@ from qfieldcloud.core.models import (
     Secret,
 )
 from qfieldcloud.core.utils2 import packages
-from qfieldcloud.project.models import QgisProject
 from qfieldcloud.project.utils.project_utils import get_qgis_major_version
 from tenacity import (
     retry,
@@ -528,9 +527,7 @@ class JobRun:
                 )
 
                 if feedback_member is None:
-                    raise FileNotFoundError(
-                        "feedback.json not found in Docker archive"
-                    )
+                    raise FileNotFoundError("feedback.json not found in Docker archive")
 
                 feedback_file = archive.extractfile(feedback_member)
                 if feedback_file is None:

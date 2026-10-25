@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 import signal
 from time import sleep
 from typing import Any
@@ -34,6 +34,7 @@ else:
         ProcessProjectfileJobRun,
         cancel_orphaned_workers,
     )
+
 
 class GracefulKiller:
     alive = True
