@@ -543,7 +543,7 @@ class JobRun:
 
         logger.info(
             "Docker worker finished: exit_code=%s",
-            status,
+            response["StatusCode"],
         )
 
         logger.debug(
