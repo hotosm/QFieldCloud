@@ -19,6 +19,7 @@ from django.forms.models import model_to_dict
 from django.utils import timezone
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from kubernetes.config.config_exception import ConfigException
 from kubernetes.client.rest import ApiException
 from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core.models import (
@@ -78,12 +79,13 @@ def load_kubernetes() -> None:
         Try in-cluster config first.
         Fall back to local kubeconfig for development.
         """
+
         try:
             k8s_config.load_incluster_config()
         except Exception:
             k8s_config.load_kube_config()
 
-class JobException(Exception):
+class JobError(Exception):
     pass
 
 
@@ -122,9 +124,8 @@ class JobRun:
                 self.job.status = Job.Status.FAILED
                 self.job.feedback = feedback
                 self.job.save(update_fields=["status", "feedback"])
-                logger.exception(msg, exc_info=err)
-            else:
-                logger.critical(msg, exc_info=err)
+
+            raise
 
         self.debug_qgis_container_is_enabled = bool(
             settings.DEBUG and settings.DEBUG_QGIS_DEBUGPY_PORT
@@ -156,6 +157,8 @@ class JobRun:
     def get_command(self) -> list[str]:
         context = self.get_context()
 
+        debug_flags = []
+
         if self.debug_qgis_container_is_enabled:
             debug_flags = [
                 "-m",
@@ -164,11 +167,15 @@ class JobRun:
                 f"0.0.0.0:{settings.DEBUG_QGIS_DEBUGPY_PORT}",
                 "--wait-for-client",
             ]
-        else:
-            debug_flags = []
+
         return [
             p % context
-            for p in ["python3", "entrypoint.py", *self.command]
+            for p in [
+                "python3",
+                *debug_flags,
+                "entrypoint.py",
+                *self.command,
+            ]
         ]
 
     def get_environment(self) -> dict[str, str]:
@@ -220,8 +227,6 @@ class JobRun:
             "QT_QPA_PLATFORM": "offscreen",
         }
 
-        return environment
-
     def get_qgis_image(self) -> str:
         if self.job.project.qgis_version:
             qgis_major_project_version = get_qgis_major_version(
@@ -232,7 +237,7 @@ class JobRun:
             qgis_major_project_version = 3
 
         if qgis_major_project_version not in self.qgis_images:
-            raise JobException(
+            raise JobError(
                 f"Unsupported QGIS major version {qgis_major_project_version} for project {self.job.project.id} stored with {self.job.project.qgis_version}."
             )
 
@@ -248,9 +253,7 @@ class JobRun:
         pass
 
     def _sanitize_name(self, name: str) -> str:
-        """
-        Kubernetes Job names must match DNS label rules.
-        """
+        """ Kubernetes Job names must match DNS label rules."""
 
         name = name.lower()
         name = re.sub(r"[^a-z0-9-]", "-", name)
