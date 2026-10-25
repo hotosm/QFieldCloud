@@ -10,7 +10,6 @@ services:
     build:
       context: ./docker-app
       target: webserver_runtime
-      network: host
     restart: unless-stopped
     command: >
       gunicorn
@@ -77,10 +76,13 @@ services:
       QFIELDCLOUD_ACCOUNT_ADAPTER: ${QFIELDCLOUD_ACCOUNT_ADAPTER}
       QFIELDCLOUD_AUTH_TOKEN_EXPIRATION_HOURS: ${QFIELDCLOUD_AUTH_TOKEN_EXPIRATION_HOURS}
       QFIELDCLOUD_USE_I18N: ${QFIELDCLOUD_USE_I18N}
+      QFIELDCLOUD_DRF_BROWSERABLE_API_RENDERER_ENABLED: ${QFIELDCLOUD_DRF_BROWSERABLE_API_RENDERER_ENABLED}
       QFIELDCLOUD_DEFAULT_LANGUAGE: ${QFIELDCLOUD_DEFAULT_LANGUAGE}
       QFIELDCLOUD_DEFAULT_TIME_ZONE: ${QFIELDCLOUD_DEFAULT_TIME_ZONE}
       QFIELDCLOUD_WORKER_TIMEOUT_S: ${QFIELDCLOUD_WORKER_TIMEOUT_S}
       QFIELDCLOUD_WORKER_DEQUEUE_INTERVAL_S: ${QFIELDCLOUD_WORKER_DEQUEUE_INTERVAL_S}
+      QFIELDCLOUD_WORKER_SDK_CONNECT_TIMEOUT_S: ${QFIELDCLOUD_WORKER_SDK_CONNECT_TIMEOUT_S}
+      QFIELDCLOUD_WORKER_SDK_READ_TIMEOUT_S: ${QFIELDCLOUD_WORKER_SDK_READ_TIMEOUT_S}
       QFIELDCLOUD_QGIS3_IMAGE_NAME: ${QFIELDCLOUD_QGIS3_IMAGE_NAME:-${COMPOSE_PROJECT_NAME}-qgis3}
       QFIELDCLOUD_QGIS4_IMAGE_NAME: ${QFIELDCLOUD_QGIS4_IMAGE_NAME:-${COMPOSE_PROJECT_NAME}-qgis4}
       QFIELDCLOUD_TRANSFORMATION_GRIDS_VOLUME_NAME: ${COMPOSE_PROJECT_NAME}_transformation_grids
@@ -153,12 +155,11 @@ services:
   qgis3:
     build:
       context: ./docker-qgis
-      network: host
       args:
         DEBUG_BUILD: ${DEBUG}
         UBUNTU_VERSION: noble
         QGIS_REPOSITORY: ubuntu-ltr
-        QGIS_VERSION: 1:3.44.13+40noble
+        QGIS_VERSION: 1:3.44.14+40noble
     tty: true
     command: bash -c "echo QGIS3 built"
     logging: *default-logging
@@ -167,12 +168,11 @@ services:
   qgis4:
     build:
       context: ./docker-qgis
-      network: host
       args:
         DEBUG_BUILD: ${DEBUG}
         UBUNTU_VERSION: resolute
         QGIS_REPOSITORY: debian
-        QGIS_VERSION: 1:4.2.1+44resolute
+        QGIS_VERSION: 1:4.2.2+44resolute
     tty: true
     command: bash -c "echo QGIS4 built"
     logging: *default-logging
@@ -182,7 +182,6 @@ services:
     <<: *default-django
     build:
       context: ./docker-app
-      network: host
       target: worker_wrapper_runtime
     command: python manage.py dequeue
     user: root # TODO change me to least privileged docker-capable user on the host (/!\ docker users!=hosts users, use UID rather than username)

@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from datetime import timedelta
 from pathlib import Path
 from traceback import TracebackException
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import docker
 import docker.client
@@ -22,7 +22,6 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.forms.models import model_to_dict
 from django.utils import timezone
-from docker.models.containers import Container
 from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core.models import (
     ApplyJob,
@@ -43,6 +42,9 @@ from tenacity import (
     wait_random_exponential,
 )
 
+if TYPE_CHECKING:
+    from docker.models.containers import Container
+
 logger = logging.getLogger(__name__)
 
 # TODO @suricactus: Delete when QF-6868 Log DEBUG level when DEBUG=True, see https://app.clickup.com/t/QF-6868
@@ -60,7 +62,7 @@ TOKEN_EXPIRATION_TIME_BUFFER_S = 60
 """Extra time in seconds for the dedicated worker token to keep the token valid, in addition to `JobRun.container_timeout_secs`. Useful when the worker takes longer to start."""
 
 
-class JobException(Exception):
+class JobError(Exception):
     pass
 
 
@@ -197,6 +199,12 @@ class JobRun:
             "QFIELDCLOUD_EXTRA_ENVVARS": json.dumps(sorted(extra_envvars.keys())),
             "QFIELDCLOUD_TOKEN": token.key,
             "QFIELDCLOUD_URL": settings.QFIELDCLOUD_WORKER_QFIELDCLOUD_URL,
+            "QFC_SDK_CONNECT_TIMEOUT_S": str(
+                settings.QFIELDCLOUD_WORKER_SDK_CONNECT_TIMEOUT_S
+            ),
+            "QFC_SDK_READ_TIMEOUT_S": str(
+                settings.QFIELDCLOUD_WORKER_SDK_READ_TIMEOUT_S
+            ),
             "JOB_ID": self.job_id,
             "PROJ_DOWNLOAD_DIR": TRANSFORMATION_GRIDS_PATH,
             "QT_QPA_PLATFORM": "offscreen",
@@ -214,7 +222,7 @@ class JobRun:
             qgis_major_project_version = 3
 
         if qgis_major_project_version not in self.qgis_images:
-            raise JobException(
+            raise JobError(
                 f"Unsupported QGIS major version {qgis_major_project_version} for project {self.job.project.id} stored with {self.job.project.qgis_version}."
             )
 
@@ -445,7 +453,9 @@ class JobRun:
             mem_limit=config.WORKER_QGIS_MEMORY_LIMIT,
             cpu_shares=config.WORKER_QGIS_CPU_SHARES,
             labels={
-                "app": f"{settings.ENVIRONMENT}_worker",
+                "qfieldcloud.role": "worker",
+                "qfieldcloud.environment": settings.ENVIRONMENT,
+                "qfieldcloud.compose_project_name": settings.COMPOSE_PROJECT_NAME,
                 "type": self.job.type,
                 "job_id": str(self.job.id),
                 "project_id": str(self.job.project_id),
@@ -758,13 +768,50 @@ class CreateProjectJobRun(JobRun):
         "%(project__id)s",
     ]
 
+    def get_qgis_image(self) -> str:
+        """Picks the QGIS image with the version of the clone project.
+
+        If the clone project doesn't have one, uses the source project's QGIS version.
+
+        A clone's own `qgis_version` is still unset at this point, so
+        without this, we'd always fall through to `JobRun.get_qgis_image()`'s
+        QGIS 3 default instead of matching the source project's version.
+        """
+        clone_from_project = None
+        if hasattr(self.job.project, "seed"):
+            clone_from_project = self.job.project.seed.clone_from_project
+
+        if (
+            self.job.project.qgis_version
+            or not clone_from_project
+            or not clone_from_project.qgis_version
+        ):
+            return super().get_qgis_image()
+
+        qgis_major_project_version = get_qgis_major_version(
+            clone_from_project.qgis_version
+        )
+
+        if qgis_major_project_version not in self.qgis_images:
+            raise JobError(
+                f"Unsupported QGIS major version {qgis_major_project_version} for project {self.job.project.id} cloned from project {clone_from_project.id} stored with {clone_from_project.qgis_version}."
+            )
+
+        return self.qgis_images[qgis_major_project_version]
+
 
 def cancel_orphaned_workers() -> None:
     client: docker.client.DockerClient = docker.from_env()
 
     try:
         running_workers: list[Container] = client.containers.list(
-            filters={"label": f"app={settings.ENVIRONMENT}_worker"},
+            filters={
+                "label": [
+                    "qfieldcloud.role=worker",
+                    f"qfieldcloud.environment={settings.ENVIRONMENT}",
+                    f"qfieldcloud.compose_project_name={settings.COMPOSE_PROJECT_NAME}",
+                ],
+            },
         )
     except docker.errors.NotFound:
         # We don't mind empty references since they mean there is no

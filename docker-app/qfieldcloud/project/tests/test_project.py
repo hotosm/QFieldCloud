@@ -170,6 +170,143 @@ class QfcTestCase(APITransactionTestCase):
         self.assertNotIn("seed", response.data)
         self.assertNotIn("xlsform_file", response.data)
 
+    def test_create_project_with_json2qgis(self):
+        """Project creation validates the seed/json2qgis/xlsform combination."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        seed = json.dumps(
+            {
+                "basemap_provider": "osm",
+                "basemap_style": "standard",
+                "extent": "22,41,29,45.67",
+            }
+        )
+
+        with self.subTest(
+            "Test seed with json2qgis creates the project and attaches the file"
+        ):
+            # The create endpoint only checks that `json2qgis_file` is present and
+            # it doesn't validate the file's schema, so a fake blob is enough here.
+            json2qgis_content = b'{"fake": "json2qgis content"}'
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "seed_json2qgis_project",
+                    "owner": "user1",
+                    "is_public": False,
+                    "seed": seed,
+                    "json2qgis_file": SimpleUploadedFile(
+                        "project.json",
+                        json2qgis_content,
+                        content_type="application/json",
+                    ),
+                },
+                format="multipart",
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+            project = Project.objects.get(name="seed_json2qgis_project")
+            self.assertEqual(
+                Job.objects.filter(
+                    project=project, type=Job.Type.CREATE_PROJECT
+                ).count(),
+                1,
+            )
+
+            seed_obj = ProjectSeed.objects.get(project=project)
+            self.assertEqual(seed_obj.json2qgis_file.read(), json2qgis_content)
+            self.assertFalse(seed_obj.xlsform_file)
+            self.assertIsNone(seed_obj.settings["xlsform"])
+
+            self.assertNotIn("seed", response.data)
+            self.assertNotIn("json2qgis_file", response.data)
+
+        with self.subTest(
+            "Test the API rejects xlsform and json2qgis together, creates no project"
+        ):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "seed_both_files",
+                    "owner": "user1",
+                    "is_public": False,
+                    "seed": seed,
+                    "xlsform_file": SimpleUploadedFile("survey.xlsx", b"xls"),
+                    "json2qgis_file": SimpleUploadedFile("project.json", b"{}"),
+                },
+                format="multipart",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(response.data["code"], "multiple_project_seed_sources")
+            self.assertEqual(Project.objects.filter(name="seed_both_files").count(), 0)
+
+        with self.subTest("Test the API rejects json2qgis without a seed"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "json2qgis_no_seed",
+                    "owner": "user1",
+                    "is_public": False,
+                    "json2qgis_file": SimpleUploadedFile("project.json", b"{}"),
+                },
+                format="multipart",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                Project.objects.filter(name="json2qgis_no_seed").count(), 0
+            )
+
+    def test_projectseed_clean_rejects_multiple_sources(self):
+        project = Project.objects.create(
+            name="multi_source_seed", owner=self.user1, is_public=False
+        )
+
+        with self.assertRaises(ValidationError):
+            ProjectSeed.objects.create(
+                project=project,
+                extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+                settings={"schemaId": ProjectSeed.SETTINGS_SCHEMA_ID},
+                xlsform_file=ContentFile(b"xls", "survey.xlsx"),
+                json2qgis_file=ContentFile(b"{}", "project.json"),
+            )
+
+    def test_seed_json2qgis_download(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        with self.subTest(
+            "Test download returns the file content with the correct content-disposition filename"
+        ):
+            project = Project.objects.create(
+                name="json2qgis_download", owner=self.user1, is_public=False
+            )
+            ProjectSeed.objects.create(
+                project=project,
+                extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+                settings={"schemaId": ProjectSeed.SETTINGS_SCHEMA_ID},
+                json2qgis_file=ContentFile(b'{"a": 1}', "project.json"),
+            )
+
+            response = self.client.get(f"/api/v1/projects/{project.id}/seed/json2qgis/")
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(
+                response["Content-Disposition"],
+                'attachment; filename="json2qgis.json"',
+            )
+            self.assertEqual(b"".join(response.streaming_content), b'{"a": 1}')
+
+        with self.subTest("Test download 404s when the seed has no json2qgis file"):
+            project = Project.objects.create(
+                name="json2qgis_absent", owner=self.user1, is_public=False
+            )
+            ProjectSeed.objects.create(
+                project=project,
+                extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+                settings={"schemaId": ProjectSeed.SETTINGS_SCHEMA_ID},
+            )
+
+            response = self.client.get(f"/api/v1/projects/{project.id}/seed/json2qgis/")
+            self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
     def test_create_project_with_seed_no_xlsform(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
@@ -310,6 +447,32 @@ class QfcTestCase(APITransactionTestCase):
         response = self.client.get("/api/v1/projects/?include-public=true")
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(len(response.data), 0)
+
+    def test_list_projects_excluding_project_type(self):
+        # Create a `regular` project for user1
+        Project.objects.create(name="project1", owner=self.user1)
+
+        # Create a `shared_datasets` project for user1
+        Project.objects.create(name=SHARED_DATASETS_PROJECT_NAME, owner=self.user1)
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        # `shared_datasets` is listed by default
+        response = self.client.get("/api/v1/projects/")
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 2)
+
+        # `exclude_project_type` removes it
+        response = self.client.get(
+            "/api/v1/projects/?exclude_project_type=shared_datasets"
+        )
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "project1")
+
+        # `exclude_project_type` with an unknown project type is rejected
+        response = self.client.get("/api/v1/projects/?exclude_project_type=bogus")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_list_collaborators_of_project(self):
         # Create a project of user1
@@ -594,9 +757,169 @@ class QfcTestCase(APITransactionTestCase):
         self.assertEqual(json[1]["user_role"], "reader")
         self.assertEqual(json[1]["user_role_origin"], "public")
 
-    def test_private_project_memberships(self):
-        """Tests for QF-1553 - limit collaboration on private projects"""
+    def test_public_project_uses_public_collaborator_role(self):
+        """A public project's `public_collaborator_role` determines the role granted to non-collaborators, and only while the project stays public.
 
+        Both projects are owned by user2 and queried as user1 below, so the
+        asserted roles always come from the `public` origin, not ownership.
+        """
+        # Default `public_collaborator_role` is `reader`
+        project1 = Project.objects.create(
+            name="project1", is_public=True, owner=self.user2
+        )
+
+        self.assertEqual(
+            project1.public_collaborator_role, ProjectCollaboratorRole.READER
+        )
+
+        # A public project with a non-default `public_collaborator_role` grants that role
+        project2 = Project.objects.create(
+            name="project2",
+            is_public=True,
+            owner=self.user2,
+            public_collaborator_role=ProjectCollaboratorRole.EDITOR,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        def get_user_role(project):
+            response = self.client.get(f"/api/v1/projects/{project.pk}/", follow=True)
+            self.assertTrue(status.is_success(response.status_code))
+            return response.json()["user_role"]
+
+        self.assertEqual(get_user_role(project1), "reader")
+        self.assertEqual(get_user_role(project2), "editor")
+
+        # `public_collaborator_role` only takes effect while the project is public
+        project2.is_public = False
+        project2.save()
+
+        response = self.client.get(f"/api/v1/projects/{project2.pk}/", follow=True)
+        self.assertEqual(response.status_code, 403)
+
+        # Changing `public_collaborator_role` on an already-public project takes effect immediately
+        project2.is_public = True
+        project2.public_collaborator_role = ProjectCollaboratorRole.REPORTER
+        project2.save()
+
+        self.assertEqual(get_user_role(project2), "reporter")
+
+    def test_public_collaborator_role_rejects_privileged_roles(self):
+        """Test that `public_collaborator_role` must not allow granting `admin` and `manager` to everyone, since that role is handed out to any user once a project is public."""
+        for role in (ProjectCollaboratorRole.ADMIN, ProjectCollaboratorRole.MANAGER):
+            with self.subTest(role=role):
+                with self.assertRaises(ValidationError):
+                    Project.objects.create(
+                        name="project1",
+                        is_public=True,
+                        owner=self.user1,
+                        public_collaborator_role=role,
+                    )
+
+    def test_public_collaborator_role_via_api(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        with self.subTest("Test the API defaults `public_collaborator_role` to reader"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "project_default_role",
+                    "owner": "user1",
+                    "is_public": True,
+                },
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(response.json()["public_collaborator_role"], "reader")
+
+        with self.subTest("Test the API creates a project with the given role"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "project_editor_role",
+                    "owner": "user1",
+                    "is_public": True,
+                    "public_collaborator_role": "editor",
+                },
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(response.json()["public_collaborator_role"], "editor")
+            self.assertEqual(
+                Project.objects.get(
+                    name="project_editor_role"
+                ).public_collaborator_role,
+                ProjectCollaboratorRole.EDITOR,
+            )
+
+        project = Project.objects.get(name="project_editor_role")
+
+        with self.subTest("Test the API updates the role of an existing project"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "reporter"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.json()["public_collaborator_role"], "reporter")
+
+            project.refresh_from_db()
+            self.assertEqual(
+                project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+            )
+
+        with self.subTest("Test the API rejects `admin` role"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "admin"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        with self.subTest("Test the API rejects `manager` role"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "manager"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        with self.subTest("Test the API rejects an unknown role"):
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "superuser"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        project.refresh_from_db()
+        self.assertEqual(
+            project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+        )
+
+        with self.subTest("Test a non-admin user cannot change the role"):
+            self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
+            response = self.client.patch(
+                f"/api/v1/projects/{project.pk}/",
+                {"public_collaborator_role": "reader"},
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+            project.refresh_from_db()
+            self.assertEqual(
+                project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+            )
+
+    def test_private_project_memberships(self):
+        """Tests for QF-1553 - limit collaboration on private projects."""
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
         # Create a project with a collaborator
@@ -604,17 +927,19 @@ class QfcTestCase(APITransactionTestCase):
         o = Organization.objects.create(username="o", organization_owner=u)
         p = Project.objects.create(name="p", owner=u, is_public=True)
 
-        set_subscription(u, max_premium_collaborators_per_private_project=0)
+        subscription = set_subscription(
+            u, max_premium_collaborators_per_private_project=1
+        )
 
         apiurl = f"/api/v1/projects/{p.pk}/"
 
         self.client.raise_request_exception = True
 
-        def assertNoRole():
+        def assertNoRole():  # noqa: N802
             response = self.client.get(apiurl, follow=True)
             self.assertEqual(response.status_code, 403)
 
-        def assertRole(role, origin):
+        def assertRole(role, origin):  # noqa: N802
             response = self.client.get(apiurl, follow=True)
             self.assertEqual(response.status_code, 200)
             json = response.json()
@@ -630,9 +955,14 @@ class QfcTestCase(APITransactionTestCase):
         )
         assertRole("manager", "collaborator")
 
-        # If project is made private, the collaboration is invalid
+        # The project can go private while its collaborator count is within the plan limit
         p.is_public = False
         p.save()
+        assertRole("manager", "collaborator")
+
+        # Dropping the plan limit below the collaborator count invalidates the role
+        subscription.plan.max_premium_collaborators_per_private_project = 0
+        subscription.plan.save()
         assertNoRole()
 
         # Making the owner an organization is not enough as user is not member of that org
@@ -678,6 +1008,38 @@ class QfcTestCase(APITransactionTestCase):
         c1.save()
 
         self.assertEqual(len(p1.direct_collaborators), 0)
+
+    def test_exceeds_private_collaborator_limit(self):
+        """Test the behavior of exceeding the private collaborator limit for a project."""
+        o1 = Organization.objects.create(username="o1", organization_owner=self.user1)
+        OrganizationMember.objects.create(organization=o1, member=self.user2)
+        OrganizationMember.objects.create(organization=o1, member=self.user3)
+        set_subscription(o1, max_premium_collaborators_per_private_project=1)
+
+        p1 = Project.objects.create(name="p1", owner=o1, is_public=False)
+        self.assertFalse(p1.exceeds_private_collaborator_limit)
+
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=self.user2, role=ProjectCollaboratorRole.READER
+        )
+        # at the limit, not over it
+        self.assertFalse(p1.exceeds_private_collaborator_limit)
+
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=self.user3, role=ProjectCollaboratorRole.READER
+        )
+        # now over the limit
+        self.assertTrue(p1.exceeds_private_collaborator_limit)
+
+    def test_exceeds_private_collaborator_limit_unlimited_plan(self):
+        """Test the behavior of exceeding the private collaborator limit for a project when the plan allows unlimited collaborators."""
+        set_subscription(self.user1, max_premium_collaborators_per_private_project=-1)
+        p1 = Project.objects.create(name="p1", owner=self.user1, is_public=False)
+        ProjectCollaborator.objects.create(
+            project=p1, collaborator=self.user2, role=ProjectCollaboratorRole.READER
+        )
+
+        self.assertFalse(p1.exceeds_private_collaborator_limit)
 
     def test_collaborators_count_no_collaborators(self):
         # baseline: owner-only project counts 0
@@ -1110,7 +1472,6 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_restricted_data_last_updated_at_on_file_upload(self):
         """Test that restricted_data_last_updated_at is updated when restricted files are uploaded."""
-
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
         # Create a project
@@ -1168,7 +1529,6 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_restricted_data_last_updated_at_on_file_delete(self):
         """Test that restricted_data_last_updated_at is updated when restricted files are deleted."""
-
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
         # Create a project
@@ -1395,6 +1755,9 @@ class QfcTestCase(APITransactionTestCase):
     def test_clone_project(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
         project = self._create_clonable_project()
+        # A non-default role, so the clone can only match it by copying it
+        project.public_collaborator_role = ProjectCollaboratorRole.REPORTER
+        project.save()
 
         response = self.client.post(
             "/api/v1/projects/",
@@ -1412,6 +1775,9 @@ class QfcTestCase(APITransactionTestCase):
         clone_seed = ProjectSeed.objects.get(project=cloned_project)
         self.assertEqual(cloned_project.owner, self.user1)
         self.assertEqual(cloned_project.is_public, project.is_public)
+        self.assertEqual(
+            cloned_project.public_collaborator_role, ProjectCollaboratorRole.REPORTER
+        )
         self.assertEqual(
             cloned_project.overwrite_conflicts, project.overwrite_conflicts
         )
@@ -1672,3 +2038,102 @@ class QfcTestCase(APITransactionTestCase):
                     project=project, collaborator=self.user3
                 ).exists()
             )
+
+    def test_project_teams_field(self):
+        """`GET /projects/<id>/` returns `teams`, the caller's team names in the project's owning organization."""
+        # org1 has three teams. Nobody joins gamma.
+        org1 = Organization.objects.create(
+            username="org1", organization_owner=self.user1
+        )
+        team_alpha = Team.objects.create(username="@org1/alpha", team_organization=org1)
+        team_beta = Team.objects.create(username="@org1/beta", team_organization=org1)
+        Team.objects.create(username="@org1/gamma", team_organization=org1)
+
+        # A second org with its own team, to check teams don't leak across orgs.
+        org2 = Organization.objects.create(
+            username="org2", organization_owner=self.user3
+        )
+        team_delta = Team.objects.create(username="@org2/delta", team_organization=org2)
+
+        # user2 is in team alpha and beta (org1), and in delta (org2).
+        OrganizationMember.objects.create(organization=org1, member=self.user2)
+        TeamMember.objects.create(team=team_alpha, member=self.user2)
+        TeamMember.objects.create(team=team_beta, member=self.user2)
+        OrganizationMember.objects.create(organization=org2, member=self.user2)
+        TeamMember.objects.create(team=team_delta, member=self.user2)
+
+        # user3 is an org1 admin but joins no team.
+        OrganizationMember.objects.create(
+            organization=org1, member=self.user3, role=OrganizationMember.Roles.ADMIN
+        )
+
+        # outsider has nothing to do with org1.
+        outsider = Person.objects.create_user(username="outsider", password="abc123")
+        outsider_token = AuthToken.objects.get_or_create(user=outsider)[0]
+
+        org_project = Project.objects.create(
+            name="org_project", is_public=True, owner=org1
+        )
+        person_project = Project.objects.create(
+            name="person_project", is_public=True, owner=self.user1
+        )
+        org_url = f"/api/v1/projects/{org_project.pk}/"
+
+        def get_teams(token, url):
+            self.client.credentials(HTTP_AUTHORIZATION="Token " + token.key)
+            response = self.client.get(url, follow=True)
+            self.assertTrue(status.is_success(response.status_code))
+            return response.json()["teams"]
+
+        # `teams` is the caller's teams in the owning organization unprefixed.
+        with self.subTest(
+            "Test an organization member of alpha and beta returns the correct teams"
+        ):
+            self.assertEqual(get_teams(self.token2, org_url), ["alpha", "beta"])
+
+        with self.subTest(
+            "Test an organization owner without a team returns empty teams"
+        ):
+            self.assertEqual(get_teams(self.token1, org_url), [])
+
+        with self.subTest(
+            "Test an organization admin without a team returns empty teams"
+        ):
+            self.assertEqual(get_teams(self.token3, org_url), [])
+
+        with self.subTest("Test an outsider on a public project returns empty teams"):
+            self.assertEqual(get_teams(outsider_token, org_url), [])
+
+        with self.subTest("Test a person-owned project returns empty teams"):
+            person_url = f"/api/v1/projects/{person_project.pk}/"
+            self.assertEqual(get_teams(self.token1, person_url), [])
+
+        # `teams` is not part of the list or write responses.
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        with self.subTest(
+            "Test that `teams` is not included in every project in the list response"
+        ):
+            response = self.client.get("/api/v1/projects/")
+            self.assertTrue(status.is_success(response.status_code))
+            self.assertGreaterEqual(len(response.json()), 1)
+            for project_data in response.json():
+                self.assertNotIn("teams", project_data)
+
+        with self.subTest("Test that `teams` is not included from the create response"):
+            response = self.client.post(
+                "/api/v1/projects/",
+                {
+                    "name": "created_project",
+                    "owner": "org1",
+                    "description": "desc",
+                    "is_public": False,
+                },
+            )
+            self.assertTrue(status.is_success(response.status_code))
+            self.assertNotIn("teams", response.json())
+
+        with self.subTest("Test that `teams` is not included in the update response"):
+            response = self.client.patch(org_url, {"description": "new desc"})
+            self.assertTrue(status.is_success(response.status_code))
+            self.assertNotIn("teams", response.json())

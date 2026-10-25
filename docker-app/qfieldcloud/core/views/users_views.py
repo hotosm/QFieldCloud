@@ -1,7 +1,10 @@
+import contextlib
+
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist
 from drf_spectacular.utils import extend_schema, extend_schema_view
-from qfieldcloud.core import pagination, permissions_utils, querysets_utils
+from qfieldcloud.core import permissions_utils, querysets_utils
 from qfieldcloud.core.models import Organization, Team
 from qfieldcloud.core.serializers import (
     CompleteUserSerializer,
@@ -31,7 +34,9 @@ class ListCreateUsersViewPermissions(permissions.BasePermission):
 class ListCreateUsersView(generics.ListCreateAPIView):
     serializer_class = PublicInfoUserSerializer
     permission_classes = [permissions.IsAuthenticated, ListCreateUsersViewPermissions]
-    pagination_class = pagination.QfcLimitOffsetPagination()
+    # This view is intentionally not paginated, `get_queryset` enforces a hard
+    # `USER_LIST_LIMIT` so a single request can never be used to enumerate the whole user base.
+    pagination_class = None
 
     def get_queryset(self):
         params = self.request.GET
@@ -39,28 +44,22 @@ class ListCreateUsersView(generics.ListCreateAPIView):
 
         project = None
         if params.get("project"):
-            try:
+            with contextlib.suppress(Project.DoesNotExist):
                 project = Project.objects.get(id=params.get("project"))
-            except Project.DoesNotExist:
-                pass
 
         organization = None
         if params.get("organization"):
-            try:
+            with contextlib.suppress(Project.DoesNotExist):
                 organization = Organization.objects.get(
                     username=params.get("organization")
                 )
-            except Project.DoesNotExist:
-                pass
 
         exclude_members_of_team = None
         if params.get("exclude_members_of_team"):
-            try:
+            with contextlib.suppress(Team.DoesNotExist, ValueError):
                 exclude_members_of_team = Team.objects.get(
                     pk=params.get("exclude_members_of_team")
                 )
-            except (Team.DoesNotExist, ValueError):
-                pass
 
         # TODO : are these GET paremters documented somewhere ? Shouldn't we use something
         # like django_filters.rest_framework.DjangoFilterBackend so they get auto-documented
@@ -76,7 +75,7 @@ class ListCreateUsersView(generics.ListCreateAPIView):
             exclude_organizations=exclude_organizations,
             exclude_teams=exclude_teams,
             invert=invert,
-        )
+        )[: settings.USER_LIST_LIMIT]
 
     def post(self, request):
         serializer = CreateUserSerializer(data=request.data)
@@ -118,7 +117,7 @@ class RetrieveUpdateUserViewPermissions(permissions.BasePermission):
     patch=extend_schema("Partially update a user"),
 )
 class RetrieveUpdateUserView(generics.RetrieveUpdateAPIView):
-    """Get or Update the authenticated user"""
+    """Get or Update the authenticated user."""
 
     permission_classes = [
         permissions.IsAuthenticated,
@@ -164,7 +163,7 @@ class ListUserOrganizationsViewPermissions(permissions.BasePermission):
     get=extend_schema(description="Get a user's organization"),
 )
 class ListUserOrganizationsView(generics.ListAPIView):
-    """Get user's organizations"""
+    """Get user's organizations."""
 
     permission_classes = [
         permissions.IsAuthenticated,

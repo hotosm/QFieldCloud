@@ -1,5 +1,6 @@
 import io
 import logging
+from importlib.resources import files
 
 from django.contrib.gis.geos import Polygon
 from django.core.files.base import ContentFile
@@ -46,7 +47,7 @@ class QfcTestCase(QfcFilesTestCaseMixin, APITransactionTestCase):
             from_queryset=Project.objects.select_related("the_qgis_file")
         )
 
-    def assertLayerData(
+    def assertLayerData(  # noqa: N802
         self, layer_data: dict, is_valid: bool, is_localized: bool, error_code: str
     ) -> None:
         self.assertEqual(layer_data["is_valid"], is_valid)
@@ -456,6 +457,55 @@ class QfcTestCase(QfcFilesTestCaseMixin, APITransactionTestCase):
         # self.assertEqual(fields[21]["name"], "comment")
         # self.assertEqual(fields[21]["type"], "String")
 
+    def test_create_project_from_json2qgis(self):
+        """A `CREATE_PROJECT` job built from a `json2qgis` seed produces the expected QGIS project."""
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.t1.key)
+
+        ProjectSeed.objects.create(
+            project=self.p1,
+            extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+            settings={
+                "schemaId": "https://app.qfield.cloud/schemas/project-seed-20251201.json",
+                "basemaps": [
+                    {
+                        "name": "OpenStreetMap (Standard)",
+                        "style": "standard",
+                        "url": "https://tile.openstreetmap.org/%7Bz%7D/%7Bx%7D/%7By%7D.png",
+                    }
+                ],
+                "xlsform": None,
+            },
+            json2qgis_file=ContentFile(
+                (
+                    files("convert2qgis") / "samples" / "json2qgis" / "sample.json"
+                ).read_bytes(),
+                "sample.json",
+            ),
+        )
+
+        Job.objects.create(
+            project=self.p1,
+            type=Job.Type.CREATE_PROJECT,
+            created_by=self.u1,
+        )
+
+        wait_for_project_ok_status(self.p1)
+
+        self.p1.refresh_from_db()
+
+        pd = self.p1.project_details
+
+        self.assertIsNotNone(pd)
+
+        layers = list(self.p1.qgis_project.layers.all())
+        layers.sort(key=lambda layer: layer.name)
+
+        # One vector layer from `sample.json` plus the basemap from the seed.
+        self.assertEqual(len(layers), 2)
+        self.assertEqual(layers[0].name, "My test layer")
+        self.assertEqual(layers[0].geom_type, QgsGeometryType.Point)
+        self.assertEqual(layers[1].name, "OpenStreetMap (Standard)")
+
     def test_thumbnail_generation_with_wrong_extent_does_not_hang(self):
         # Test that if the thumbnail generation hangs forever (e.g. due to invalid extent), the job is cancelled after the timeout and the project is still processed successfully.
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.t1.key)
@@ -624,6 +674,58 @@ class QfcTestCase(QfcFilesTestCaseMixin, APITransactionTestCase):
         self.refresh_project(cloned_project)
 
         self.assertEqual(cloned_project.qgis_project.crs, self.p1.qgis_project.crs)
+
+    def test_clone_project_uses_source_qgis_version_for_worker_image(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.t1.key)
+
+        ProjectSeed.objects.create(
+            project=self.p1,
+            extent=Polygon.from_bbox(projectseed_utils.DEFAULT_PROJECT_EXTENT),
+            settings={
+                "schemaId": ProjectSeed.SETTINGS_SCHEMA_ID,
+                "basemaps": [],
+                "xlsform": None,
+            },
+        )
+
+        Job.objects.create(
+            project=self.p1,
+            type=Job.Type.CREATE_PROJECT,
+            created_by=self.u1,
+        )
+
+        wait_for_project_ok_status(self.p1)
+
+        # Force the source project to look like it was last saved with QGIS 4,
+        # so the clone's worker image selection has a QGIS 4 version to inherit.
+        self.p1.qgis_version = "4.2.1"
+        self.p1.save(update_fields=["qgis_version"])
+
+        cloned_project = Project.objects.create(name="cloned_project", owner=self.u1)
+
+        ProjectSeed.objects.create(
+            project=cloned_project,
+            clone_from_project=self.p1,
+            settings={
+                "schemaId": ProjectSeed.SETTINGS_SCHEMA_ID,
+                "basemaps": [],
+                "xlsform": None,
+            },
+        )
+
+        job = Job.objects.create(
+            project=cloned_project,
+            type=Job.Type.CREATE_PROJECT,
+            created_by=self.u1,
+        )
+
+        wait_for_project_ok_status(cloned_project)
+
+        job.refresh_from_db()
+
+        # `Job.qgis_version` reports the QGIS app version that actually ran the
+        # job, so this confirms the worker was spawned from the QGIS 4 image.
+        self.assertTrue(job.qgis_version.startswith("4."))
 
     def test_process_projectfile_job_sets_the_qgis_version(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.t1.key)

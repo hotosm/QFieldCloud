@@ -151,7 +151,7 @@ class QfcTestCase(APITransactionTestCase):
             max_premium_collaborators_per_private_project=0,
         )
 
-    def assertProjectRole(
+    def assertProjectRole(  # noqa: N802
         self,
         project,
         user,
@@ -159,7 +159,7 @@ class QfcTestCase(APITransactionTestCase):
         origin: ProjectRoleOrigins | None = None,
         is_valid: bool = True,
     ):
-        """Asserts that user has give role/origin on project"""
+        """Asserts that user has give role/origin on project."""
         assert (role is None) == (origin is None), (
             "Both role and origin should be either defined or undefined!"
         )
@@ -293,10 +293,7 @@ class QfcTestCase(APITransactionTestCase):
         self.assertFalse(self.user3.id in queryset_ids)
 
     def test_projects_roles_and_role_origins(self):
-        """
-        Checks user_role and user_role_origin are correctly defined
-        """
-
+        """Checks user_role and user_role_origin are correctly defined."""
         roles = ProjectCollaboratorRole
         role_origins = ProjectRoleOrigins
 
@@ -333,7 +330,7 @@ class QfcTestCase(APITransactionTestCase):
         # fmt: on
 
     def test_private_project_memberships(self):
-        """Tests for QF-1553 - limit collaboration on private projects"""
+        """Tests for QF-1553 - limit collaboration on private projects."""
         # Shorthands
         roles = ProjectCollaboratorRole
         role_origins = ProjectRoleOrigins
@@ -343,9 +340,9 @@ class QfcTestCase(APITransactionTestCase):
         o = Organization.objects.create(username="o", organization_owner=u)
         p = Project.objects.create(name="p", owner=u, is_public=True)
 
-        set_subscription(
+        subscription = set_subscription(
             u,
-            max_premium_collaborators_per_private_project=0,
+            max_premium_collaborators_per_private_project=1,
         )
 
         u1 = Person.objects.create(username="u1")
@@ -359,9 +356,15 @@ class QfcTestCase(APITransactionTestCase):
         )
         self.assertProjectRole(p, u1, roles.MANAGER, role_origins.COLLABORATOR, True)
 
-        # If project is made private, the collaboration is invalid
+        # The project can go private while its collaborator count is within the plan limit
         p.is_public = False
         p.save()
+        self.assertProjectRole(p, u1, roles.MANAGER, role_origins.COLLABORATOR, True)
+
+        # Dropping the plan limit below the collaborator count invalidates the role.
+        # The project is locked and the collaborator stays on the project but loses access.
+        subscription.plan.max_premium_collaborators_per_private_project = 0
+        subscription.plan.save()
         self.assertProjectRole(p, u1, roles.MANAGER, role_origins.COLLABORATOR, False)
 
         # Making the owner an organization is not enough as user is not member of that org

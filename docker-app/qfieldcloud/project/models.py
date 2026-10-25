@@ -22,10 +22,10 @@ from django.db import transaction
 from django.db.models import Case, Exists, F, OuterRef, Prefetch, Q, When
 from django.db.models import Value as V
 from django.db.models.aggregates import Count, Sum
+from django.db.models.functions import MD5
 from django.shortcuts import get_object_or_404
 from django.urls import reverse_lazy
 from django.utils.translation import gettext as _
-from django_stubs_ext import StrOrPromise
 
 from qfieldcloud.core import validators
 from qfieldcloud.core.fields import DynamicStorageFileField
@@ -40,9 +40,17 @@ from qfieldcloud.core.models import (
     TeamMember,
     User,
 )
-from qfieldcloud.project.enums import LayerErrorCode, QgsGeometryType, QgsLayerType
+from qfieldcloud.core.models_utils import get_stored_value
+from qfieldcloud.project.enums import (
+    LayerErrorCode,
+    ProjectCollaboratorRole,
+    QgsGeometryType,
+    QgsLayerType,
+)
 
 if TYPE_CHECKING:
+    from django_stubs_ext import StrOrPromise
+
     from qfieldcloud.core.models import (
         JobQuerySet,
         ProjectCollaboratorQueryset,
@@ -75,7 +83,7 @@ class ProjectQueryset(models.QuerySet):
     This query is very similar to `PersonQueryset.for_project`, don't forget to update it too.
     """
 
-    def for_user(self, user: "User", skip_invalid: bool = False):
+    def for_user(self, user: User, skip_invalid: bool = False):
         count = Count(
             "collaborators",
             filter=Q(collaborators__collaborator__type=User.Type.PERSON),
@@ -89,11 +97,11 @@ class ProjectQueryset(models.QuerySet):
             .filter(id=OuterRef("owner"))
         )
         max_premium_collaborators_per_private_project_q = Q(
-            owner__useraccount__current_subscription_vw__plan__max_premium_collaborators_per_private_project=V(
+            owner__useraccount__current_subscription_vw__active_plan__max_premium_collaborators_per_private_project=V(
                 -1
             )
         ) | Q(
-            owner__useraccount__current_subscription_vw__plan__max_premium_collaborators_per_private_project__gte=count
+            owner__useraccount__current_subscription_vw__active_plan__max_premium_collaborators_per_private_project__gte=count
         )
 
         # Assemble the condition
@@ -123,13 +131,15 @@ class ProjectQueryset(models.QuerySet):
 
         return qs
 
-    def slim(self) -> "ProjectQueryset":
-        """A light-weight fetch for permission checks, which run on every
+    def slim(self) -> ProjectQueryset:
+        """A minimal fetch of projects with only a few pre-loaded fields.
+
+        A light-weight fetch for permission checks, which run on every
         request and only need a project's id, owner, and public flag.
         """
         return self.only("id", "name", "is_public", "project_type", "owner_id")
 
-    def with_prefetch(self) -> "ProjectQueryset":
+    def with_prefetch(self) -> ProjectQueryset:
         """A heavier version of the `Project` with all common `select_related` and `prefetch_related` in place."""
         return (
             self.defer("project_details")
@@ -161,7 +171,7 @@ class ProjectQueryset(models.QuerySet):
         )
 
 
-def get_slim_project_or_raise(project_id: uuid.UUID | str | None) -> "Project":
+def get_slim_project_or_raise(project_id: uuid.UUID | str | None) -> Project:
     """Fetch a project for a permission check, or raise `Http404` if it doesn't exist.
 
     Only use this where the caller needs `pk`/`owner`/`is_public` and nothing
@@ -169,14 +179,13 @@ def get_slim_project_or_raise(project_id: uuid.UUID | str | None) -> "Project":
     in `ProjectQueryset`). Fetching more fields off the result triggers extra queries,
     so for anything that needs the full project, use `get_object_or_404(Project, ...)`.
     """
-
     # NOTE raises `Http404`, not `Project.DoesNotExist`: DRF treats both the same, see `core.rest_utils.exception_handler`.
     # TODO @suricactus: add `qs.fetch_mode(models.RAISE)` once on Django 6.1, see https://app.clickup.com/t/2192114/QF-8624
     return get_object_or_404(Project.objects.slim(), pk=project_id)  # type: ignore[attr-defined]
 
 
 def get_project_file_storage_default() -> str:
-    """Get the default file storage for the newly created project
+    """Get the default file storage for the newly created project.
 
     Returns:
         the name of the storage
@@ -202,7 +211,7 @@ def get_project_are_attachments_versioned_default() -> bool:
     return settings.STORAGE_PROJECT_DEFAULT_ATTACHMENTS_VERSIONED
 
 
-def get_project_thumbnail_upload_to(instance: "Project", _filename: str) -> str:
+def get_project_thumbnail_upload_to(instance: Project, _filename: str) -> str:
     """Variable storage key for thumbnails.
 
     We use a variable storage key to avoid creating object storage level versions for
@@ -218,6 +227,7 @@ def get_project_thumbnail_upload_to(instance: "Project", _filename: str) -> str:
 
 class Project(models.Model):
     """Represent a QFieldcloud project.
+
     It corresponds to a directory on the file system.
 
     The owner of a project is an Organization.
@@ -252,10 +262,16 @@ class Project(models.Model):
         ProjectType.TEMPLATE,
     ]
 
+    # Roles that can be granted to all users when a project is public.
+    PUBLIC_COLLABORATOR_ROLES = [
+        ProjectCollaboratorRole.READER,
+        ProjectCollaboratorRole.REPORTER,
+        ProjectCollaboratorRole.EDITOR,
+    ]
+
     @property
     def localized_layers(self) -> list[QgisLayer]:
-        """
-        Retrieve all `QgisLayer` rows of this project's `QgisProject` that have their `is_localized` flag set to `True`.
+        """Retrieve all `QgisLayer` rows of this project's `QgisProject` that have their `is_localized` flag set to `True`.
 
         Returns:
             A list of `QgisLayer` instances with `is_localized == True`.
@@ -287,19 +303,19 @@ class Project(models.Model):
         ]
 
     # All files related to the project, including both the `PROJECT_FILE` and `PACKAGE_FILE` file types.
-    all_files: "FileQueryset"
+    all_files: FileQueryset
 
     # The secrets that are attached for a specific project.
-    secrets: "SecretQueryset"
+    secrets: SecretQueryset
 
     # The jobs that are ran for a specific project.
-    jobs: "JobQuerySet"
+    jobs: JobQuerySet
 
     # The project create seed.
-    seed: "ProjectSeed"
+    seed: ProjectSeed
 
     # The QGIS project for this project.
-    qgis_project: "QgisProject"
+    qgis_project: QgisProject
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(
@@ -330,6 +346,15 @@ class Project(models.Model):
         default=False,
         help_text=_(
             "Projects marked as public are visible to (but not editable by) anyone."
+        ),
+    )
+
+    public_collaborator_role = models.CharField(
+        max_length=10,
+        choices=[(role.value, role.label) for role in PUBLIC_COLLABORATOR_ROLES],
+        default=ProjectCollaboratorRole.READER,
+        help_text=_(
+            "The role automatically granted to every user on this project. This setting only takes effect if the project is marked as public."
         ),
     )
 
@@ -533,9 +558,7 @@ class Project(models.Model):
 
     @cached_property
     def shared_datasets_project(self) -> Project | None:
-        """
-        Returns the localized datasets project for the same owner, or `None` if no such project exists.
-        """
+        """Returns the localized datasets project for the same owner, or `None` if no such project exists."""
         try:
             project = Project.objects.get(
                 project_type=self.ProjectType.SHARED_DATASETS,
@@ -629,15 +652,12 @@ class Project(models.Model):
 
     @cached_property
     def is_regular_project(self) -> bool:
-        """
-        Returns `True` if the project type is a regular project, otherwise `False`.
-        """
+        """Returns `True` if the project type is a regular project, otherwise `False`."""
         return self.project_type == self.ProjectType.REGULAR
 
     @cached_property
     def is_shared_datasets_project(self) -> bool:
-        """
-        Returns `True` if the project is the shared datasets project, otherwise `False`.
+        """Returns `True` if the project is the shared datasets project, otherwise `False`.
 
         Deprecated: use `project_type` instead.
         """
@@ -645,13 +665,12 @@ class Project(models.Model):
 
     @cached_property
     def is_template_project(self) -> bool:
-        """
-        Returns `True` if the project type is a template project, otherwise `False`.
-        """
+        """Returns `True` if the project type is a template project, otherwise `False`."""
         return self.project_type == self.ProjectType.TEMPLATE
 
-    def get_missing_localized_layers(self) -> list["QgisLayer"]:
-        """
+    def get_missing_localized_layers(self) -> list[QgisLayer]:
+        """Return list of missing localized layers.
+
         Of all localized layers, return those whose filenames aren’t in `available_filenames`,
         which means they are not present in the associated localized datasets project storage.
 
@@ -740,9 +759,7 @@ class Project(models.Model):
 
     @property
     def has_attachments_files(self) -> bool:
-        """
-        Checks if the project has at least one attachment file.
-        """
+        """Checks if the project has at least one attachment file."""
         return any(f.is_attachment() for f in self.project_files)
 
     @property
@@ -751,7 +768,7 @@ class Project(models.Model):
         return not self.is_public
 
     @property
-    def project_files(self) -> "FileQueryset":
+    def project_files(self) -> FileQueryset:
         """Returns the files of type PROJECT related to the project."""
         return self.all_files.with_type_project()
 
@@ -765,8 +782,7 @@ class Project(models.Model):
 
     @property
     def has_online_vector_data(self) -> bool | None:
-        """Returns None if the project has no associated `QgisProject`"""
-
+        """Returns None if the project has no associated `QgisProject`."""
         qgis_project = getattr(self, "qgis_project", None)
 
         if qgis_project is None:
@@ -958,6 +974,28 @@ class Project(models.Model):
                                 ),
                             }
                         )
+
+                # add a warning if a pg layer has a hard-coded user or pwd in the datasource
+                if layer.provider_name == "postgres" and (
+                    "user=" in layer.datasource or "password=" in layer.datasource
+                ):
+                    problems.append(
+                        {
+                            "layer": layer_name,
+                            "level": "warning",
+                            "code": "hardcoded_pg_credentials",
+                            "description": _(
+                                _(
+                                    'Layer "{}" has a hard-coded postgres credentials in the datasource.'
+                                )
+                            ).format(layer_name),
+                            "solution": _(
+                                _(
+                                    "Consider using a pg_service entry and a QFieldCloud Secret instead."
+                                )
+                            ),
+                        }
+                    )
         else:
             problems.append(
                 {
@@ -979,27 +1017,21 @@ class Project(models.Model):
         return self.jobs.unfinished().exists()
 
     @cached_property
-    def status(self) -> "Project.Status":
+    def status(self) -> Project.Status:
         # NOTE the status is NOT stored in the db, because it might be outdated
         if self.has_unfinished_jobs:
             return Project.Status.BUSY
         else:
             status = Project.Status.OK
             status_code = Project.StatusCode.OK
-            max_premium_collaborators_per_private_project = self.owner.useraccount.current_subscription.plan.max_premium_collaborators_per_private_project
 
             # TODO use self.problems to get if there are project problems
             if (
-                not self.has_the_qgis_file or not self.qgis_project
+                not self.has_the_qgis_file or not getattr(self, "qgis_project", None)
             ) and not self.is_shared_datasets_project:
                 status = Project.Status.FAILED
                 status_code = Project.StatusCode.FAILED_PROCESS_PROJECTFILE
-            elif (
-                not self.is_public
-                and max_premium_collaborators_per_private_project != -1
-                and max_premium_collaborators_per_private_project
-                < self.direct_collaborators.count()
-            ):
+            elif not self.is_public and self.exceeds_private_collaborator_limit:
                 status = Project.Status.FAILED
                 status_code = Project.StatusCode.TOO_MANY_COLLABORATORS
 
@@ -1023,6 +1055,11 @@ class Project(models.Model):
 
     @property
     def direct_collaborators(self) -> ProjectCollaboratorQueryset:
+        """Collaborators that are individual people added straight to the project.
+
+        Doesn't include members from collaborating teams, incognito collaborators
+        and the owner.
+        """
         if self.owner.is_organization:
             exclude_pks = [self.owner.organization.organization_owner_id]
         else:
@@ -1040,6 +1077,11 @@ class Project(models.Model):
 
     @property
     def total_collaborators(self) -> PersonQueryset:
+        """Every person with access to the project, whether added directly or as a member of a team that collaborates on it.
+
+        Merges the direct collaborators with the members of each collaborating team,
+        drops the owner and incognito entries, and returns a deduplicated `Person` queryset.
+        """
         if self.owner.is_organization:
             exclude_pks = [self.owner.organization.organization_owner_id]
         else:
@@ -1057,7 +1099,7 @@ class Project(models.Model):
             .values_list("member_id", flat=True)
         )
         return cast(
-            PersonQueryset,
+            "PersonQueryset",
             Person.objects.filter(
                 Q(pk__in=direct_ids) | Q(pk__in=team_member_ids)
             ).distinct(),
@@ -1065,7 +1107,21 @@ class Project(models.Model):
 
     @property
     def total_collaborators_count(self) -> int:
+        """Number of people returned by `total_collaborators`."""
         return self.total_collaborators.count()
+
+    @property
+    def exceeds_private_collaborator_limit(self) -> bool:
+        """Whether the project has more direct collaborators than the owner's plan allows on a private project.
+
+        Always `False` when the plan sets no limit.
+        """
+        plan = self.owner.useraccount.current_subscription.plan
+        max_collaborators = plan.max_premium_collaborators_per_private_project
+        return (
+            max_collaborators != -1
+            and max_collaborators < self.direct_collaborators.count()
+        )
 
     @property
     def owner_can_create_job(self):
@@ -1097,7 +1153,58 @@ class Project(models.Model):
                 )
             )
 
+        if self.public_collaborator_role not in self.PUBLIC_COLLABORATOR_ROLES:
+            raise ValidationError(
+                _("`public_collaborator_role` must be one of `{}`, got `{}`.").format(
+                    self.PUBLIC_COLLABORATOR_ROLES, self.public_collaborator_role
+                )
+            )
+
+        self._validate_make_private()
+
         super().clean(*args, **kwargs)
+
+    def _validate_make_private(self) -> None:
+        """Blocks turning a "public" project "private" while it has collaborators that a "private" project would not accept.
+
+        That happens when a collaborator is not a member of the owning organization,
+        or when the collaborator count is over what the owner's plan allows on a private project.
+
+        Only the switch from public to private is checked. A project that is already
+        private and over the limit (say, after a plan downgrade) is left as it is.
+        """
+        # only when an existing public project is being turned private
+        if self.is_public or get_stored_value(self, "is_public") is not True:
+            return
+
+        if self.owner.is_organization:
+            member_ids = self.owner.organization.members.values_list(
+                "member_id", flat=True
+            )
+            non_member_usernames = sorted(
+                self.direct_collaborators.exclude(
+                    collaborator_id__in=member_ids
+                ).values_list("collaborator__username", flat=True)
+            )
+            if non_member_usernames:
+                raise ValidationError(
+                    _(
+                        "This project has collaborators who are not members of the "
+                        "organization: {}. Remove them, or add them to the "
+                        "organization, before making it private."
+                    ).format(", ".join(non_member_usernames))
+                )
+
+        if self.exceeds_private_collaborator_limit:
+            # NOTE: if `exceeds_private_collaborator_limit` changes, this validation logic should be updated accordingly.
+            plan_limit = self.owner.useraccount.current_subscription.plan.max_premium_collaborators_per_private_project
+            raise ValidationError(
+                _(
+                    "This project has {} collaborators but the owner's plan allows "
+                    "only {} on a private project. Remove some collaborators before "
+                    "making it private."
+                ).format(self.direct_collaborators.count(), plan_limit)
+            )
 
     def save(self, recompute_storage=False, *args, **kwargs):
         self.clean()
@@ -1137,9 +1244,14 @@ class Project(models.Model):
         return self.project_files.get_by_name(filename)  # type: ignore
 
 
-def get_seed_xlsform_upload_to(instance: "ProjectSeed", filename: str) -> str:
+def get_seed_xlsform_upload_to(instance: ProjectSeed, filename: str) -> str:
     file_extension = Path(filename).suffix.lower()
     return f"projects/{instance.project.id}/seeds/xlsforms/xlsform{file_extension}"
+
+
+def get_seed_json2qgis_upload_to(instance: "ProjectSeed", filename: str) -> str:
+    file_extension = Path(filename).suffix.lower()
+    return f"projects/{instance.project.id}/seeds/json2qgis/json2qgis{file_extension}"
 
 
 class ProjectSeed(models.Model):
@@ -1161,7 +1273,7 @@ class ProjectSeed(models.Model):
         related_name="derived_seeds",
         blank=True,
     )
-    """The project to copy from, if any. It is mutually exclusive with `xlsform_file`."""
+    """The project to copy from, if any. It is mutually exclusive with `xlsform_file` and `json2qgis_file`."""
 
     # TODO @Rakanhf: make the `extent` field not nullable once we add `Project.extent` field.
     extent = models.PolygonField(
@@ -1178,16 +1290,30 @@ class ProjectSeed(models.Model):
         null=True,
         blank=True,
     )
-    """XLSForm file used to create the project, if any. It is mutually exclusive with `clone_from_project`."""
+    """XLSForm file used to create the project, if any. It is mutually exclusive with `clone_from_project` and `json2qgis_file`."""
+
+    json2qgis_file = models.FileField(
+        upload_to=get_seed_json2qgis_upload_to,
+        # the s3 storage has 1024 bytes (not chars!) limit: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
+        max_length=1024,
+        null=True,
+        blank=True,
+    )
+    """JSON project definition file used to create the project, if any. It is mutually exclusive with `clone_from_project` and `xlsform_file`."""
 
     settings = models.JSONField()
     """The settings used during the project creation. There must be a `schemaId` field."""
 
     def clean(self, *args, **kwargs) -> None:
-        if self.xlsform_file and self.clone_from_project:
+        provided_sources = [
+            bool(self.xlsform_file),
+            bool(self.json2qgis_file),
+            bool(self.clone_from_project),
+        ]
+        if sum(provided_sources) > 1:
             raise ValidationError(
                 _(
-                    "Both `xlsform_file` or `clone_from_project` cannot be set at the same time."
+                    "At most one of `xlsform_file`, `json2qgis_file` or `clone_from_project` can be set at the same time."
                 )
             )
 
@@ -1209,7 +1335,7 @@ class ProjectSeed(models.Model):
 
 
 def to_geom_or_none(geom_str: str | None, srid: int = 4326) -> GEOSGeometry | None:
-    """geom_wkt may be WKT, EWKT or HEXEWKB"""
+    """geom_wkt may be WKT, EWKT or HEXEWKB."""
     if not geom_str:
         return None
 
@@ -1224,10 +1350,10 @@ class QgisProjectQueryset(models.QuerySet):
     @transaction.atomic()
     def update_from_details(
         self,
-        project: "Project",
-        file_version: "FileVersion",
+        project: Project,
+        file_version: FileVersion,
         details: QgisProjectDetails,
-    ) -> "QgisProject":
+    ) -> QgisProject:
         custom_properties = {
             QgisProject.ATTACHMENT_DIRS_KEY: details.get("attachment_dirs") or ["DCIM"],
             QgisProject.DATA_DIRS_KEY: details.get("data_dirs") or [],
@@ -1329,7 +1455,7 @@ class QgisProject(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     # The layers that belong to this QGIS project.
-    layers: "QgisLayerQuerySet"
+    layers: QgisLayerQuerySet
 
     @property
     def attachment_dirs(self) -> list[str]:
@@ -1378,9 +1504,9 @@ class QgisLayerQuerySet(models.QuerySet):
     @transaction.atomic()
     def update_from_details(
         self,
-        qgis_project: "QgisProject",
+        qgis_project: QgisProject,
         ordered_layer_ids: list[str],
-        layers_by_id: dict[str, "LayerDetails"],
+        layers_by_id: dict[str, LayerDetails],
     ) -> None:
         """Sync QGIS project's `QgisLayer` rows to match `layers_by_id`.
 
@@ -1391,7 +1517,6 @@ class QgisLayerQuerySet(models.QuerySet):
         Existing rows are only written to the database if a field actually
         changed, to avoid needless `updated_at` bumps and writes on re-sync.
         """
-
         existing_layers_by_qgis_layer_id = {}
         for layer in qgis_project.layers.select_for_update():
             existing_layers_by_qgis_layer_id[layer.qgis_layer_id] = layer
@@ -1587,8 +1712,11 @@ class QgisLayer(models.Model):
         verbose_name_plural = _("QGIS layers")
         ordering = ["qgis_project", "ordering"]
         constraints = [
+            # `qgis_layer_id` is unbounded and can be too large for a Postgres
+            # btree index row, so this indexes MD5(qgis_layer_id) instead.
             models.UniqueConstraint(
-                fields=["qgis_project", "qgis_layer_id"],
-                name="layer_qgis_project_qgis_layer_id_uniq",
+                F("qgis_project"),
+                MD5("qgis_layer_id"),
+                name="layer_qgis_project_qgis_layer_id_md5_uniq",
             )
         ]

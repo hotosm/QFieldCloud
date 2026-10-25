@@ -145,6 +145,7 @@ class ProjectSeedInline(admin.StackedInline):
         "extent",
         "clone_from_project",
         "xlsform_file",
+        "json2qgis_file",
         "settings__pre",
     )
 
@@ -369,6 +370,7 @@ class ProjectAdmin(QFieldCloudModelAdmin):
         "name",
         "description",
         "is_public",
+        "public_collaborator_role",
         "owner",
         "created_by",
         "status",
