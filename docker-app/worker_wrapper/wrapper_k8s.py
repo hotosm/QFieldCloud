@@ -97,13 +97,15 @@ class JobRun:
     """Mapping of QGIS major version to the corresponding QGIS Docker image name, e.g. `{"qgis3": "qfieldcloud-qgis3"}`."""
 
     def __init__(self, job_id: str) -> None:
-        self.job = None
+        job = None
         self.container_timeout_secs = settings.QFIELDCLOUD_WORKER_TIMEOUT_S
 
         try:
             self.job_id = job_id
-            self.job = self.job_class.objects.select_related().get(id=job_id)
+            job = self.job_class.objects.select_related().get(id=job_id)
+            self.job = job
             self.shared_tempdir = Path(tempfile.mkdtemp(dir=TMP_FILE))
+
         except Exception as err:
             feedback: dict[str, Any] = {}
             tb = TracebackException.from_exception(err)
@@ -112,15 +114,12 @@ class JobRun:
             feedback["error_class"] = type(err).__name__
             feedback["error_stack"] = "".join(tb.format())
 
-            logger.exception(
-                "Uncaught exception when constructing JobRun",
-                exc_info=err,
-            )
+            logger.exception("Uncaught exception when constructing JobRun")
 
-            if self.job:
-                self.job.status = Job.Status.FAILED
-                self.job.feedback = feedback
-                self.job.save(update_fields=["status", "feedback"])
+            if job is not None:
+                job.status = Job.Status.FAILED
+                job.feedback = feedback
+                job.save(update_fields=["status", "feedback"])
 
             raise
 
@@ -133,7 +132,7 @@ class JobRun:
             4: settings.QFIELDCLOUD_QGIS4_IMAGE_NAME,
         }
 
-        if self.debug_qgis_container_is_enabled and self.job is not None:
+        if self.debug_qgis_container_is_enabled:
             logger.warning(
                 f"Debugging is enabled for job {self.job.id}. "
                 "The worker will wait for debugger to attach on port "
