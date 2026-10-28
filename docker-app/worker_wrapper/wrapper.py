@@ -1,6 +1,9 @@
+import io
 import json
 import logging
+import os
 import shutil
+import tarfile
 import tempfile
 import uuid
 from collections.abc import Iterable
@@ -30,7 +33,6 @@ from qfieldcloud.core.models import (
     Secret,
 )
 from qfieldcloud.core.utils2 import packages
-from qfieldcloud.project.models import QgisProject
 from qfieldcloud.project.utils.project_utils import get_qgis_major_version
 from tenacity import (
     retry,
@@ -51,7 +53,7 @@ if settings.DEBUG:
 RETRY_COUNT = 5
 TIMEOUT_ERROR_EXIT_CODE = -1
 DOCKER_SIGKILL_EXIT_CODE = 137
-TMP_FILE = Path("/tmp")
+TMP_FILE = Path(os.environ.get("QFC_SHARED_DIR", "/tmp"))
 TRANSFORMATION_GRIDS_PATH = "/transformation_grids"
 """Path inside the worker container where the transformation grids volume `settings.QFIELDCLOUD_TRANSFORMATION_GRIDS_VOLUME_NAME` is mounted."""
 
@@ -507,11 +509,53 @@ class JobRun:
         except requests.exceptions.ConnectionError:
             logs = b"[QFC/Worker/1001] Failed to read logs."
 
+        # Copy feedback.json from the QGIS container back to the wrapper.
+        # This is required when the wrapper runs inside Kubernetes because
+        # the Docker daemon does not share the wrapper pod's filesystem.
+        try:
+            archive_stream, _ = container.get_archive("/io/feedback.json")
+            archive_data = b"".join(archive_stream)
+
+            with tarfile.open(fileobj=io.BytesIO(archive_data)) as archive:
+                feedback_member = next(
+                    (
+                        member
+                        for member in archive.getmembers()
+                        if Path(member.name).name == "feedback.json"
+                    ),
+                    None,
+                )
+
+                if feedback_member is None:
+                    raise FileNotFoundError("feedback.json not found in Docker archive")
+
+                feedback_file = archive.extractfile(feedback_member)
+                if feedback_file is None:
+                    raise FileNotFoundError(
+                        "Unable to extract feedback.json from Docker archive"
+                    )
+
+                self.shared_tempdir.joinpath("feedback.json").write_bytes(
+                    feedback_file.read()
+                )
+
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "Failed to copy feedback.json from worker container.",
+                exc_info=err,
+            )
+
         retriable(lambda: container.stop())()
         retriable(lambda: container.remove())()
 
         logger.info(
-            f"Finished execution with code {response['StatusCode']}, logs:\n{logs.decode()}"
+            "Docker worker finished: exit_code=%s",
+            response["StatusCode"],
+        )
+
+        logger.debug(
+            "Docker worker logs:\n%s",
+            logs.decode("utf-8", errors="replace"),
         )
 
         if response["StatusCode"] == TIMEOUT_ERROR_EXIT_CODE:
@@ -701,10 +745,6 @@ class ProcessProjectfileJobRun(JobRun):
             update_fields.append("qgis_version")
 
         project.save(update_fields=update_fields)
-
-        QgisProject.objects.update_from_details(
-            project, project.the_qgis_file.latest_version, project.project_details
-        )
 
     def after_docker_exception(self) -> None:
         project = self.job.project
